@@ -1,0 +1,25 @@
+[
+  {
+    "Author": "小狗饼",
+    "Name": "石之家自动签到",
+    "Description": "在游戏中自动完成 FF14 石之家(ff14risingstones)每日签到。可自动打开浏览器登录并读取盛大通行证 Cookie，也可手动粘贴 Cookie。命令: /shijia",
+    "Punchline": "自动完成石之家每日签到",
+    "InternalName": "ShijiaSignIn",
+    "AssemblyVersion": "1.0.0.0",
+    "TestingAssemblyVersion": null,
+    "RepoUrl": "https://github.com/Chenling3/ShijiaSignIn",
+    "ApplicableVersion": "any",
+    "DalamudApiLevel": 15,
+    "Tags": ["签到", "石之家", "check-in", "sdo"],
+    "IconUrl": "",
+    "ImageUrls": [],
+    "IsHide": false,
+    "IsTestingExclusive": false,
+    "LastUpdate": 1793816500,
+    "DownloadCount": 0,
+    "DownloadLinkInstall": "https://github.com/Chenling3/ShijiaSignIn/releases/latest/download/latest.zip",
+    "DownloadLinkTesting": "https://github.com/Chenling3/ShijiaSignIn/releases/latest/download/latest.zip",
+    "DownloadLinkUpdate": "https://github.com/Chenling3/ShijiaSignIn/releases/latest/download/latest.zip",
+    "Changelog": "首次发布"
+  }
+]

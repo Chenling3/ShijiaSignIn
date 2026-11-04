@@ -1,0 +1,8 @@
+bin/
+obj/
+dist/
+latest.zip
+pages/
+*.user
+.vs/
+.vscode/

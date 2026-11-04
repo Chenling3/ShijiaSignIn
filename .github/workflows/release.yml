@@ -1,0 +1,100 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（留空则用 csproj 里的 <Version>，例如 1.0.1.0）'
+        required: false
+        default: ''
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $v = "${{ github.event.inputs.version }}"
+          if ([string]::IsNullOrWhiteSpace($v)) {
+            $refName = "${{ github.ref_name }}"
+            if ($refName.StartsWith('v')) { $v = $refName.Substring(1) }
+          }
+          if ($v -notmatch '^\d+(\.\d+){1,3}$') {
+            $csproj = Get-Content "$env:GITHUB_WORKSPACE\ShijiaSignIn.csproj" -Raw
+            $v = [regex]::Match($csproj, '<Version>(.*?)</Version>').Groups[1].Value.Trim()
+          }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Resolved version: $v"
+
+      - name: Bump manifest version
+        shell: pwsh
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          $m = "$env:GITHUB_WORKSPACE\ShijiaSignIn.json"
+          $c = Get-Content $m -Raw -Encoding UTF8
+          $c = [regex]::Replace($c, '"AssemblyVersion"\s*:\s*"[^"]*"', '"AssemblyVersion": "' + $v + '"')
+          Set-Content $m -Value $c -Encoding UTF8
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $dlp = "$env:GITHUB_WORKSPACE\ref\"
+          dotnet build -c Release -p:DalamudLibPath="$dlp" -p:Version="${{ steps.version.outputs.version }}"
+
+      - name: Package latest.zip
+        shell: pwsh
+        run: |
+          $ws = $env:GITHUB_WORKSPACE
+          $dist = Join-Path $ws "dist\ShijiaSignIn"
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+          Copy-Item (Join-Path $ws "bin\Release\ShijiaSignIn.dll") $dist
+          Copy-Item (Join-Path $ws "bin\Release\ShijiaSignIn.deps.json") $dist
+          Copy-Item (Join-Path $ws "ShijiaSignIn.json") $dist
+          Compress-Archive -Path (Join-Path $dist "*") -DestinationPath (Join-Path $ws "latest.zip") -Force
+          Get-ChildItem $dist | ForEach-Object { Write-Host "packaged: $($_.Name)" }
+
+      - name: Update pluginmaster.json
+        shell: pwsh
+        run: |
+          $ws = $env:GITHUB_WORKSPACE
+          $v = "${{ steps.version.outputs.version }}"
+          $now = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+          $pm = "$ws\pluginmaster.json"
+          $c = Get-Content $pm -Raw -Encoding UTF8
+          $c = [regex]::Replace($c, '"AssemblyVersion"\s*:\s*"[^"]*"', '"AssemblyVersion": "' + $v + '"')
+          $c = [regex]::Replace($c, '"LastUpdate"\s*:\s*\d+', '"LastUpdate": ' + $now)
+          $c = [regex]::Replace($c, '"Changelog"\s*:\s*"[^"]*"', '"Changelog": "Release ' + $v + '"')
+          Set-Content $pm -Value $c -Encoding UTF8
+          $pages = Join-Path $ws "pages"
+          New-Item -ItemType Directory -Path $pages -Force | Out-Null
+          Copy-Item $pm $pages
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: latest.zip
+          name: ${{ steps.version.outputs.version }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || steps.version.outputs.version }}
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: pages
+          force_orphan: true
