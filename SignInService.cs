@@ -5,6 +5,7 @@ using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Dalamud.Game.Text.SeStringHandling;
 
 namespace ShijiaSignIn;
 
@@ -21,6 +22,19 @@ public sealed class SignInService : IDisposable
     private const string MsgSuccess = "帮你签到好啦小仓鼠~";
     private const string MsgFail = "哎呀，好像哪里出了问题，快带着截图找我吧？";
     private const string MsgAlready = "签过到啦笨蛋仓鼠！";
+    private const string MsgNoCharacter = "还没有绑定角色，先去石之家网页绑定一下游戏角色吧~";
+
+    // UIColor row id：healer green / tank blue（来自 Dalamud.Colors 职业色）
+    private const ushort ColorGreen = 504;
+    private const ushort ColorBlue = 37;
+
+    private enum NotifyKind
+    {
+        Info,    // 白色默认
+        Success, // 绿色
+        Error,   // 红色
+        Already, // 蓝色
+    }
 
     private readonly Configuration configuration;
     private readonly HttpClient httpClient;
@@ -92,13 +106,13 @@ public sealed class SignInService : IDisposable
             if (this.configuration.AutoOpenBrowser && this.OnLoginRequired != null)
                 _ = this.OnLoginRequired();
             else
-                Notify("尚未配置 Cookie。用 /shijia 打开设置填入盛大通行证 Cookie。", error: true);
+                Notify("尚未配置 Cookie。用 /shijia 打开设置填入盛大通行证 Cookie。", NotifyKind.Error);
             return SignInResult.NeedsLogin;
         }
 
         if (!await this.signInLock.WaitAsync(0).ConfigureAwait(false))
         {
-            Notify("已有一个签到请求正在进行中，请稍候。", error: false);
+            Notify("已有一个签到请求正在进行中，请稍候。");
             return SignInResult.Blocked;
         }
 
@@ -133,7 +147,7 @@ public sealed class SignInService : IDisposable
             if (response.StatusCode != HttpStatusCode.OK)
             {
                 Service.Log.Warning($"[ShijiaSignIn] signIn HTTP {(int)response.StatusCode}");
-                Notify(MsgFail, error: true);
+                Notify(MsgFail, NotifyKind.Error);
                 return SignInResult.Blocked;
             }
 
@@ -145,7 +159,7 @@ public sealed class SignInService : IDisposable
         catch (Exception ex)
         {
             Service.Log.Error($"[ShijiaSignIn] 签到异常: {Sanitize(ex.Message)}");
-            Notify(MsgFail, error: true);
+            Notify(MsgFail, NotifyKind.Error);
             return SignInResult.Blocked;
         }
         finally
@@ -190,7 +204,7 @@ public sealed class SignInService : IDisposable
         catch
         {
             Service.Log.Warning($"[ShijiaSignIn] 无法解析响应: {Sanitize(body)}");
-            Notify(MsgFail, error: true);
+            Notify(MsgFail, NotifyKind.Error);
             return SignInResult.Unknown;
         }
 
@@ -198,27 +212,36 @@ public sealed class SignInService : IDisposable
         if (code is 10105 or 10403 or -10350174)
         {
             Service.Log.Warning($"[ShijiaSignIn] 登录失效 code={code} msg={msg}");
-            Notify(MsgFail, error: true);
+            Notify(MsgFail, NotifyKind.Error);
             return SignInResult.NeedsLogin;
         }
 
-        this.lastSignDate = DateTime.Now.ToString("yyyy-MM-dd");
-
-        var already = msg.Contains("已签") || msg.Contains("已经");
-        if (already)
+        // 未绑定游戏角色
+        if (code == 10103)
         {
-            Notify(MsgAlready, error: false);
+            Service.Log.Warning($"[ShijiaSignIn] 未绑定角色 code={code} msg={msg}");
+            Notify(MsgNoCharacter, NotifyKind.Error);
+            return SignInResult.Blocked;
+        }
+
+        // 已签到：10001=今天已签过；10301=重复请求被限流（说明已有签到请求在处理/已成功）
+        if (code == 10001 || code == 10301 || msg.Contains("已签") || msg.Contains("已经"))
+        {
+            this.lastSignDate = DateTime.Now.ToString("yyyy-MM-dd");
+            Notify(MsgAlready, NotifyKind.Already);
             return SignInResult.AlreadySigned;
         }
 
-        if (code == 0 || code == 200 || code == 1 || code is null)
+        // 成功：石之家标准成功码 10000，兼容 0/200/1/null
+        if (code == 10000 || code == 0 || code == 200 || code == 1 || code is null)
         {
-            Notify(MsgSuccess, error: false);
+            this.lastSignDate = DateTime.Now.ToString("yyyy-MM-dd");
+            Notify(MsgSuccess, NotifyKind.Success);
             return SignInResult.Success;
         }
 
         Service.Log.Warning($"[ShijiaSignIn] 未知响应 code={code} msg={msg}");
-        Notify(MsgFail, error: true);
+        Notify(MsgFail, NotifyKind.Error);
         return SignInResult.Unknown;
     }
 
@@ -231,7 +254,7 @@ public sealed class SignInService : IDisposable
             if (this.lastBrowserLoginTrigger.HasValue &&
                 (now - this.lastBrowserLoginTrigger.Value) < TimeSpan.FromMinutes(2))
             {
-                Notify("刚刚已尝试自动登录，请稍候再试，或手动输入 /shijia login。", error: true);
+                Notify("刚刚已尝试自动登录，请稍候再试，或手动输入 /shijia login。", NotifyKind.Error);
                 return;
             }
             this.lastBrowserLoginTrigger = now;
@@ -262,7 +285,7 @@ public sealed class SignInService : IDisposable
 
     private static string Sanitize(string s) => s.Replace('{', '[').Replace('}', ']');
 
-    private void Notify(string message, bool error)
+    private void Notify(string message, NotifyKind kind = NotifyKind.Info)
     {
         if (this.disposed)
             return;
@@ -276,11 +299,31 @@ public sealed class SignInService : IDisposable
             if (this.disposed)
                 return;
             var text = $"[石之家签到] {message}";
-            if (error)
-                Service.ChatGui.PrintError(text);
-            else
-                Service.ChatGui.Print(text);
+            switch (kind)
+            {
+                case NotifyKind.Success:
+                    Service.ChatGui.Print(Colored(text, ColorGreen));
+                    break;
+                case NotifyKind.Already:
+                    Service.ChatGui.Print(Colored(text, ColorBlue));
+                    break;
+                case NotifyKind.Error:
+                    Service.ChatGui.PrintError(text);
+                    break;
+                default:
+                    Service.ChatGui.Print(text);
+                    break;
+            }
         });
+    }
+
+    private static SeString Colored(string text, ushort colorKey)
+    {
+        var sb = new SeStringBuilder();
+        sb.AddUiForeground(colorKey);
+        sb.AddText(text);
+        sb.AddUiForegroundOff();
+        return sb.BuiltString;
     }
 
     public void Dispose()
