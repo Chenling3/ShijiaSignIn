@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Text.Json;
@@ -17,12 +18,15 @@ public sealed class SignInService : IDisposable
 {
     private const string PreflightUrl = "https://ff14risingstones.web.sdo.com/";
     private const string SignInUrl = "https://apiff14risingstones.web.sdo.com/api/home/sign/signIn";
+    private const string SignRewardListUrl = "https://apiff14risingstones.web.sdo.com/api/home/sign/signRewardList";
+    private const string GetSignRewardUrl = "https://apiff14risingstones.web.sdo.com/api/home/sign/getSignReward";
     private const string ChromeUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
     private const string MsgSuccess = "帮你签到好啦小仓鼠~";
     private const string MsgFail = "哎呀，好像哪里出了问题，快带着截图找我吧？";
     private const string MsgAlready = "签过到啦笨蛋仓鼠！";
     private const string MsgNoCharacter = "还没有绑定角色，先去石之家网页绑定一下游戏角色吧~";
+    private const string MsgRewardClaimed = "签到奖励也帮你领好啦小仓鼠~";
 
     // UIColor row id：healer green / tank blue（来自 Dalamud.Colors 职业色）
     private const ushort ColorGreen = 504;
@@ -39,6 +43,7 @@ public sealed class SignInService : IDisposable
     private readonly Configuration configuration;
     private readonly HttpClient httpClient;
     private readonly SemaphoreSlim signInLock = new(1, 1);
+    private readonly SemaphoreSlim rewardLock = new(1, 1);
 
     private Timer? dailyTimer;
     private string? lastSignDate;   // yyyy-MM-dd，仅成功/已签时写入
@@ -152,6 +157,8 @@ public sealed class SignInService : IDisposable
             }
 
             var result = InterpretResponse(body);
+            if (result == SignInResult.Success || result == SignInResult.AlreadySigned)
+                _ = ClaimRewardsAsync(); // 签到成功/已签后，自动领取当月可领的签到奖励
             if (result == SignInResult.NeedsLogin)
                 this.MaybeTriggerBrowserLogin();
             return result;
@@ -236,7 +243,9 @@ public sealed class SignInService : IDisposable
         if (code == 10000 || code == 0 || code == 200 || code == 1 || code is null)
         {
             this.lastSignDate = DateTime.Now.ToString("yyyy-MM-dd");
-            Notify(MsgSuccess, NotifyKind.Success);
+            var days = ExtractSignDays(body);
+            var successMsg = days != null ? $"{MsgSuccess} 已连续签到 {days} 天~" : MsgSuccess;
+            Notify(successMsg, NotifyKind.Success);
             return SignInResult.Success;
         }
 
@@ -262,6 +271,139 @@ public sealed class SignInService : IDisposable
         }
     }
 
+    private sealed record RewardItem(int Id, int IsGet, string Name, int Num);
+
+    /// <summary>
+    /// 签到成功后自动领取当月可领的签到奖励。
+    /// 独立于签到锁运行，避免阻塞签到；有独立的奖励锁防止并发重复领取。
+    /// </summary>
+    private async Task ClaimRewardsAsync()
+    {
+        if (this.disposed)
+            return;
+
+        if (!await this.rewardLock.WaitAsync(0).ConfigureAwait(false))
+            return; // 已有领奖在进行
+
+        try
+        {
+            var month = DateTime.Now.ToString("yyyy-MM");
+            var items = await FetchRewardListAsync(month).ConfigureAwait(false);
+            if (items == null || items.Count == 0)
+                return; // 查询失败或无奖励数据
+
+            var available = items.Where(i => i.IsGet == 0).ToList();
+            if (available.Count == 0)
+            {
+                Service.Log.Information("[ShijiaSignIn] 当月没有可领取的签到奖励");
+                return;
+            }
+
+            Service.Log.Information($"[ShijiaSignIn] 开始领取 {available.Count} 份签到奖励");
+            var claimedNames = new List<string>();
+            foreach (var item in available)
+            {
+                if (await ClaimSingleRewardAsync(item.Id, month).ConfigureAwait(false))
+                    claimedNames.Add($"{item.Name} x{item.Num}");
+            }
+
+            if (claimedNames.Count > 0)
+                Notify($"{MsgRewardClaimed} 领取了：{string.Join("、", claimedNames)}", NotifyKind.Success);
+            else
+                Service.Log.Warning("[ShijiaSignIn] 签到奖励全部领取失败");
+        }
+        catch (Exception ex)
+        {
+            Service.Log.Error($"[ShijiaSignIn] 领奖异常: {Sanitize(ex.Message)}");
+        }
+        finally
+        {
+            this.rewardLock.Release();
+        }
+    }
+
+    private async Task<List<RewardItem>?> FetchRewardListAsync(string month)
+    {
+        var tempsuid = Guid.NewGuid().ToString("N");
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"{SignRewardListUrl}?month={month}&tempsuid={tempsuid}");
+        request.Headers.TryAddWithoutValidation("Referer", "https://ff14risingstones.web.sdo.com/");
+        request.Headers.TryAddWithoutValidation("User-Agent", this.EffectiveUserAgent);
+        request.Headers.TryAddWithoutValidation("Accept", "application/json, text/plain, */*");
+        request.Headers.TryAddWithoutValidation("Cookie", this.configuration.CookieString);
+
+        using var response = await this.httpClient.SendAsync(request).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        Service.Log.Information($"[ShijiaSignIn] rewardList HTTP {(int)response.StatusCode} body={Sanitize(body)}");
+
+        if (response.StatusCode != HttpStatusCode.OK)
+            return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array)
+            {
+                Service.Log.Warning($"[ShijiaSignIn] 领奖列表无 data 数组: {Sanitize(body)}");
+                return null;
+            }
+
+            var list = new List<RewardItem>();
+            foreach (var el in data.EnumerateArray())
+            {
+                var id = ReadInt(el, "id");
+                var isGet = ReadInt(el, "is_get") ?? -1;
+                if (id.HasValue)
+                    list.Add(new RewardItem(id.Value, isGet, ReadString(el, "item_name") ?? "未知奖励", ReadInt(el, "num") ?? 1));
+            }
+            return list;
+        }
+        catch (Exception ex)
+        {
+            Service.Log.Warning($"[ShijiaSignIn] 无法解析领奖列表: {Sanitize(ex.Message)}");
+            return null;
+        }
+    }
+
+    private async Task<bool> ClaimSingleRewardAsync(int id, string month)
+    {
+        var tempsuid = Guid.NewGuid().ToString("N");
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"{GetSignRewardUrl}?tempsuid={tempsuid}")
+        {
+            Content = new FormUrlEncodedContent(new[]
+            {
+                new KeyValuePair<string, string>("id", id.ToString()),
+                new KeyValuePair<string, string>("month", month),
+                new KeyValuePair<string, string>("tempsuid", tempsuid),
+            }),
+        };
+        request.Headers.TryAddWithoutValidation("Referer", "https://ff14risingstones.web.sdo.com/");
+        request.Headers.TryAddWithoutValidation("Origin", "https://ff14risingstones.web.sdo.com");
+        request.Headers.TryAddWithoutValidation("User-Agent", this.EffectiveUserAgent);
+        request.Headers.TryAddWithoutValidation("Accept", "*/*");
+        request.Headers.TryAddWithoutValidation("X-Requested-With", "XMLHttpRequest");
+        request.Headers.TryAddWithoutValidation("Cookie", this.configuration.CookieString);
+
+        using var response = await this.httpClient.SendAsync(request).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        Service.Log.Information($"[ShijiaSignIn] getSignReward id={id} HTTP {(int)response.StatusCode} body={Sanitize(body)}");
+
+        if (response.StatusCode != HttpStatusCode.OK)
+            return false;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var code = ReadLong(doc.RootElement, "code");
+            // 石之家标准成功码 10000；兼容 0/200/1/null
+            return code is 10000 or 0 or 200 or 1 or null;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static long? ReadLong(JsonElement el, string name)
     {
         if (el.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt64(out var n))
@@ -273,6 +415,45 @@ public sealed class SignInService : IDisposable
     {
         if (el.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String)
             return v.GetString();
+        return null;
+    }
+
+    private static int? ReadInt(JsonElement el, string name)
+    {
+        if (el.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var n))
+            return n;
+        return null;
+    }
+
+    /// <summary>
+    /// 从签到成功响应里提取「连续签到天数」（data.continuousDays 为数字；data.totalDays 为字符串，作兜底）。
+    /// 真实响应示例：data={sqMsg:"...", continuousDays:2, totalDays:"2", sqExp:5, shopExp:200}
+    /// </summary>
+    private static string? ExtractSignDays(string body)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object)
+                return null;
+
+            // 连续签到天数（数字）
+            if (data.TryGetProperty("continuousDays", out var cd) && cd.ValueKind == JsonValueKind.Number && cd.TryGetInt32(out var continuous))
+                return continuous.ToString();
+
+            // 总签到天数（字符串，兜底）
+            if (data.TryGetProperty("totalDays", out var td))
+            {
+                var s = td.ValueKind == JsonValueKind.String ? td.GetString() : td.ToString();
+                if (!string.IsNullOrWhiteSpace(s))
+                    return s;
+            }
+        }
+        catch
+        {
+            // 解析失败则不显示天数，退回纯成功提示
+        }
         return null;
     }
 
@@ -331,6 +512,7 @@ public sealed class SignInService : IDisposable
         this.disposed = true;
         this.dailyTimer?.Dispose();
         this.signInLock.Dispose();
+        this.rewardLock.Dispose();
         this.httpClient.Dispose();
     }
 }
