@@ -20,7 +20,7 @@ public sealed class SignInService : IDisposable
     private const string SignInUrl = "https://apiff14risingstones.web.sdo.com/api/home/sign/signIn";
     private const string SignRewardListUrl = "https://apiff14risingstones.web.sdo.com/api/home/sign/signRewardList";
     private const string GetSignRewardUrl = "https://apiff14risingstones.web.sdo.com/api/home/sign/getSignReward";
-    private const string GetUserInfoUrl = "https://apiff14risingstones.web.sdo.com/api/home/userInfo/getUserInfo";
+    private const string MySignLogUrl = "https://apiff14risingstones.web.sdo.com/api/home/sign/mySignLog";
     private const string ChromeUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
     private const string MsgSuccess = "帮你签到好啦小仓鼠~";
@@ -467,7 +467,7 @@ public sealed class SignInService : IDisposable
     }
 
     /// <summary>
-    /// 主动查询签到天数（/shijia status）。优先实时调 getUserInfo 递归找签到天数字段；找不到则回退到上次签到成功时缓存的连续天数。
+    /// 主动查询签到天数（/shijia status）。实时调 mySignLog 拿「当月签到天数」，并结合上次签到成功时缓存的连续/累计天数。
     /// </summary>
     public async Task QuerySignStatusAsync()
     {
@@ -482,15 +482,15 @@ public sealed class SignInService : IDisposable
 
         try
         {
-            var info = await FetchSignDaysFromUserInfoAsync().ConfigureAwait(false);
+            var monthCount = await FetchMonthSignCountAsync().ConfigureAwait(false);
 
-            if (info.Continuous != null || info.Total != null)
+            if (monthCount.HasValue)
             {
-                var parts = new List<string>();
-                if (info.Continuous != null)
-                    parts.Add($"连续签到 {info.Continuous} 天");
-                if (info.Total != null)
-                    parts.Add($"累计签到 {info.Total} 天");
+                var parts = new List<string> { $"本月已签到 {monthCount.Value} 天" };
+                if (this.configuration.LastContinuousDays > 0)
+                    parts.Add($"连续签到 {this.configuration.LastContinuousDays} 天");
+                if (!string.IsNullOrWhiteSpace(this.configuration.LastTotalDays))
+                    parts.Add($"累计签到 {this.configuration.LastTotalDays} 天");
                 Notify($"查到啦：{string.Join("，", parts)}~", NotifyKind.Success);
             }
             else if (this.configuration.LastContinuousDays > 0)
@@ -512,10 +512,13 @@ public sealed class SignInService : IDisposable
         }
     }
 
-    private async Task<SignDaysInfo> FetchSignDaysFromUserInfoAsync()
+    /// <summary>
+    /// 查询当月签到天数（实时）。接口：GET /api/home/sign/mySignLog?month=YYYY-MM → data.count = 当月签到天数。
+    /// </summary>
+    private async Task<int?> FetchMonthSignCountAsync()
     {
-        var tempsuid = Guid.NewGuid().ToString("N");
-        using var request = new HttpRequestMessage(HttpMethod.Get, $"{GetUserInfoUrl}?page=1&tempsuid={tempsuid}");
+        var month = DateTime.Now.ToString("yyyy-MM");
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"{MySignLogUrl}?month={month}");
         request.Headers.TryAddWithoutValidation("Referer", "https://ff14risingstones.web.sdo.com/");
         request.Headers.TryAddWithoutValidation("User-Agent", this.EffectiveUserAgent);
         request.Headers.TryAddWithoutValidation("Accept", "application/json, text/plain, */*");
@@ -523,75 +526,24 @@ public sealed class SignInService : IDisposable
 
         using var response = await this.httpClient.SendAsync(request).ConfigureAwait(false);
         var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-        Service.Log.Information($"[ShijiaSignIn] getUserInfo HTTP {(int)response.StatusCode} body={Sanitize(body)}");
+        Service.Log.Information($"[ShijiaSignIn] mySignLog HTTP {(int)response.StatusCode} body={Sanitize(body)}");
 
         if (response.StatusCode != HttpStatusCode.OK)
-            return new SignDaysInfo(null, null);
+            return null;
 
-        return FindSignDays(body);
-    }
-
-    /// <summary>在响应 JSON 里递归搜索「连续/累计签到天数」字段（字段名不固定时兜底）。</summary>
-    private static SignDaysInfo FindSignDays(string body)
-    {
-        string? continuous = null, total = null;
         try
         {
             using var doc = JsonDocument.Parse(body);
-            SearchSignDays(doc.RootElement, ref continuous, ref total, 0);
+            var root = doc.RootElement;
+            if (root.TryGetProperty("data", out var data) && data.TryGetProperty("count", out var c) &&
+                c.ValueKind == JsonValueKind.Number && c.TryGetInt32(out var n))
+            {
+                return n;
+            }
         }
         catch
         {
             // 忽略解析失败
-        }
-        return new SignDaysInfo(continuous, total);
-    }
-
-    private static void SearchSignDays(JsonElement el, ref string? continuous, ref string? total, int depth)
-    {
-        if (depth > 5 || (continuous != null && total != null))
-            return;
-
-        if (el.ValueKind == JsonValueKind.Object)
-        {
-            continuous ??= ReadAny(el, "continuousDays", "continuous_days", "continuousSignDays", "signDays");
-            total ??= ReadAny(el, "totalDays", "total_days", "totalSignDays", "accumulateDays", "totalSignDay");
-
-            if (continuous == null || total == null)
-            {
-                foreach (var prop in el.EnumerateObject())
-                {
-                    if (continuous != null && total != null)
-                        break;
-                    SearchSignDays(prop.Value, ref continuous, ref total, depth + 1);
-                }
-            }
-        }
-        else if (el.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in el.EnumerateArray())
-            {
-                if (continuous != null && total != null)
-                    break;
-                SearchSignDays(item, ref continuous, ref total, depth + 1);
-            }
-        }
-    }
-
-    private static string? ReadAny(JsonElement el, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (!el.TryGetProperty(name, out var v))
-                continue;
-            if (v.ValueKind == JsonValueKind.Number)
-                return v.ToString();
-            if (v.ValueKind == JsonValueKind.String)
-            {
-                var s = v.GetString();
-                if (!string.IsNullOrWhiteSpace(s))
-                    return s;
-            }
         }
         return null;
     }
