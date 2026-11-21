@@ -20,6 +20,7 @@ public sealed class SignInService : IDisposable
     private const string SignInUrl = "https://apiff14risingstones.web.sdo.com/api/home/sign/signIn";
     private const string SignRewardListUrl = "https://apiff14risingstones.web.sdo.com/api/home/sign/signRewardList";
     private const string GetSignRewardUrl = "https://apiff14risingstones.web.sdo.com/api/home/sign/getSignReward";
+    private const string GetUserInfoUrl = "https://apiff14risingstones.web.sdo.com/api/home/userInfo/getUserInfo";
     private const string ChromeUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
     private const string MsgSuccess = "帮你签到好啦小仓鼠~";
@@ -243,8 +244,14 @@ public sealed class SignInService : IDisposable
         if (code == 10000 || code == 0 || code == 200 || code == 1 || code is null)
         {
             this.lastSignDate = DateTime.Now.ToString("yyyy-MM-dd");
-            var days = ExtractSignDays(body);
-            var successMsg = days != null ? $"{MsgSuccess} 已连续签到 {days} 天~" : MsgSuccess;
+            var info = ExtractSignInfo(body);
+            if (info.Continuous != null)
+            {
+                this.configuration.LastContinuousDays = int.TryParse(info.Continuous, out var c) ? c : 0;
+                this.configuration.LastTotalDays = info.Total ?? string.Empty;
+                this.configuration.Save();
+            }
+            var successMsg = info.Continuous != null ? $"{MsgSuccess} 已连续签到 {info.Continuous} 天~" : MsgSuccess;
             Notify(successMsg, NotifyKind.Success);
             return SignInResult.Success;
         }
@@ -425,34 +432,166 @@ public sealed class SignInService : IDisposable
         return null;
     }
 
+    /// <summary>签到天数信息（连续 + 累计）。</summary>
+    private sealed record SignDaysInfo(string? Continuous, string? Total);
+
     /// <summary>
-    /// 从签到成功响应里提取「连续签到天数」（data.continuousDays 为数字；data.totalDays 为字符串，作兜底）。
+    /// 从签到成功响应里提取「连续签到天数」与「累计天数」。
     /// 真实响应示例：data={sqMsg:"...", continuousDays:2, totalDays:"2", sqExp:5, shopExp:200}
     /// </summary>
-    private static string? ExtractSignDays(string body)
+    private static SignDaysInfo ExtractSignInfo(string body)
     {
         try
         {
             using var doc = JsonDocument.Parse(body);
             var root = doc.RootElement;
-            if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object)
-                return null;
-
-            // 连续签到天数（数字）
-            if (data.TryGetProperty("continuousDays", out var cd) && cd.ValueKind == JsonValueKind.Number && cd.TryGetInt32(out var continuous))
-                return continuous.ToString();
-
-            // 总签到天数（字符串，兜底）
-            if (data.TryGetProperty("totalDays", out var td))
+            if (root.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Object)
             {
-                var s = td.ValueKind == JsonValueKind.String ? td.GetString() : td.ToString();
-                if (!string.IsNullOrWhiteSpace(s))
-                    return s;
+                string? continuous = null, total = null;
+                if (data.TryGetProperty("continuousDays", out var cd) && cd.ValueKind == JsonValueKind.Number && cd.TryGetInt32(out var c))
+                    continuous = c.ToString();
+                if (data.TryGetProperty("totalDays", out var td))
+                {
+                    var s = td.ValueKind == JsonValueKind.String ? td.GetString() : td.ToString();
+                    if (!string.IsNullOrWhiteSpace(s))
+                        total = s;
+                }
+                return new SignDaysInfo(continuous, total);
             }
         }
         catch
         {
-            // 解析失败则不显示天数，退回纯成功提示
+            // 解析失败则不显示天数
+        }
+        return new SignDaysInfo(null, null);
+    }
+
+    /// <summary>
+    /// 主动查询签到天数（/shijia status）。优先实时调 getUserInfo 递归找签到天数字段；找不到则回退到上次签到成功时缓存的连续天数。
+    /// </summary>
+    public async Task QuerySignStatusAsync()
+    {
+        if (this.disposed)
+            return;
+
+        if (string.IsNullOrWhiteSpace(this.configuration.CookieString))
+        {
+            Notify("还没配置 Cookie 呢，用 /shijia login 登录获取~", NotifyKind.Error);
+            return;
+        }
+
+        try
+        {
+            var info = await FetchSignDaysFromUserInfoAsync().ConfigureAwait(false);
+
+            if (info.Continuous != null || info.Total != null)
+            {
+                var parts = new List<string>();
+                if (info.Continuous != null)
+                    parts.Add($"连续签到 {info.Continuous} 天");
+                if (info.Total != null)
+                    parts.Add($"累计签到 {info.Total} 天");
+                Notify($"查到啦：{string.Join("，", parts)}~", NotifyKind.Success);
+            }
+            else if (this.configuration.LastContinuousDays > 0)
+            {
+                var total = string.IsNullOrWhiteSpace(this.configuration.LastTotalDays)
+                    ? string.Empty
+                    : $"（累计签到 {this.configuration.LastTotalDays} 天）";
+                Notify($"上次签到已连续 {this.configuration.LastContinuousDays} 天{total}~", NotifyKind.Info);
+            }
+            else
+            {
+                Notify("暂时查不到签到天数，去石之家网页看一眼吧~", NotifyKind.Info);
+            }
+        }
+        catch (Exception ex)
+        {
+            Service.Log.Error($"[ShijiaSignIn] 查询签到天数异常: {Sanitize(ex.Message)}");
+            Notify(MsgFail, NotifyKind.Error);
+        }
+    }
+
+    private async Task<SignDaysInfo> FetchSignDaysFromUserInfoAsync()
+    {
+        var tempsuid = Guid.NewGuid().ToString("N");
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"{GetUserInfoUrl}?page=1&tempsuid={tempsuid}");
+        request.Headers.TryAddWithoutValidation("Referer", "https://ff14risingstones.web.sdo.com/");
+        request.Headers.TryAddWithoutValidation("User-Agent", this.EffectiveUserAgent);
+        request.Headers.TryAddWithoutValidation("Accept", "application/json, text/plain, */*");
+        request.Headers.TryAddWithoutValidation("Cookie", this.configuration.CookieString);
+
+        using var response = await this.httpClient.SendAsync(request).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        Service.Log.Information($"[ShijiaSignIn] getUserInfo HTTP {(int)response.StatusCode} body={Sanitize(body)}");
+
+        if (response.StatusCode != HttpStatusCode.OK)
+            return new SignDaysInfo(null, null);
+
+        return FindSignDays(body);
+    }
+
+    /// <summary>在响应 JSON 里递归搜索「连续/累计签到天数」字段（字段名不固定时兜底）。</summary>
+    private static SignDaysInfo FindSignDays(string body)
+    {
+        string? continuous = null, total = null;
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            SearchSignDays(doc.RootElement, ref continuous, ref total, 0);
+        }
+        catch
+        {
+            // 忽略解析失败
+        }
+        return new SignDaysInfo(continuous, total);
+    }
+
+    private static void SearchSignDays(JsonElement el, ref string? continuous, ref string? total, int depth)
+    {
+        if (depth > 5 || (continuous != null && total != null))
+            return;
+
+        if (el.ValueKind == JsonValueKind.Object)
+        {
+            continuous ??= ReadAny(el, "continuousDays", "continuous_days", "continuousSignDays", "signDays");
+            total ??= ReadAny(el, "totalDays", "total_days", "totalSignDays", "accumulateDays", "totalSignDay");
+
+            if (continuous == null || total == null)
+            {
+                foreach (var prop in el.EnumerateObject())
+                {
+                    if (continuous != null && total != null)
+                        break;
+                    SearchSignDays(prop.Value, ref continuous, ref total, depth + 1);
+                }
+            }
+        }
+        else if (el.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in el.EnumerateArray())
+            {
+                if (continuous != null && total != null)
+                    break;
+                SearchSignDays(item, ref continuous, ref total, depth + 1);
+            }
+        }
+    }
+
+    private static string? ReadAny(JsonElement el, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            if (!el.TryGetProperty(name, out var v))
+                continue;
+            if (v.ValueKind == JsonValueKind.Number)
+                return v.ToString();
+            if (v.ValueKind == JsonValueKind.String)
+            {
+                var s = v.GetString();
+                if (!string.IsNullOrWhiteSpace(s))
+                    return s;
+            }
         }
         return null;
     }

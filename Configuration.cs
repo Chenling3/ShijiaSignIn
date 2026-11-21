@@ -30,6 +30,12 @@ public class Configuration : IPluginConfiguration
     /// <summary>登录浏览器实际的 User-Agent。自动登录时读取并用于签到请求（石之家会话可能与 UA 绑定）。留空则回退 Chrome124。</summary>
     public string UserAgent { get; set; } = string.Empty;
 
+    /// <summary>最近一次签到成功时的连续签到天数（缓存，用于 /shijia status 查询兜底）。</summary>
+    public int LastContinuousDays { get; set; }
+
+    /// <summary>最近一次签到成功时的累计签到天数（缓存，用于 /shijia status 查询兜底）。</summary>
+    public string LastTotalDays { get; set; } = string.Empty;
+
     [NonSerialized]
     private IDalamudPluginInterface? pluginInterface;
 

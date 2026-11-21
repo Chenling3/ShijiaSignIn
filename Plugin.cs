@@ -31,7 +31,7 @@ public sealed class Plugin : IDalamudPlugin
 
         Service.CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
         {
-            HelpMessage = "石之家自动签到。用法: /shijia [sign|login|help]",
+            HelpMessage = "石之家自动签到。用法: /shijia [sign|login|status|help]",
         });
 
         Service.PluginInterface.UiBuilder.Draw += this.pluginUI.Draw;
@@ -68,9 +68,15 @@ public sealed class Plugin : IDalamudPlugin
             case "登录":
                 _ = this.AutoLoginAndSignAsync();
                 break;
+            case "status":
+            case "days":
+            case "查询":
+            case "天数":
+                _ = this.signInService.QuerySignStatusAsync();
+                break;
             case "help":
             case "帮助":
-                Service.ChatGui.Print("[石之家签到] 用法: /shijia 打开设置 | /shijia sign 立即签到 | /shijia login 打开浏览器登录");
+                Service.ChatGui.Print("[石之家签到] 用法: /shijia 打开设置 | /shijia sign 立即签到 | /shijia status 查询签到天数 | /shijia login 打开浏览器登录");
                 break;
             default:
                 Service.ChatGui.PrintError($"[石之家签到] 未知参数: {arguments}。用 /shijia help 查看帮助。");
